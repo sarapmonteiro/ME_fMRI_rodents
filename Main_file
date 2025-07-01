@@ -1,0 +1,633 @@
+%clear all; clc;
+
+% Select the experiment/data/image to analyze.
+main_folder = '/Users/saramonteiro/Desktop/ME_analysis';
+study_name = '20250115_154540_SM_fMRI_MD_newcrp_11194_NM_1_5';
+project = 'T2star scan 1';
+exp_no = 10;                    
+
+
+%Load data
+%filename = [main_folder filesep 'Results' filesep study_name filesep project ];
+filename = [main_folder filesep study_name filesep project ];
+load([filename filesep 'Data_' num2str(exp_no) '.mat']);
+
+
+% Remove first and last 1000 reps
+x = 56; % nr inicial de voxeis na primeira dim
+y = 72; % nr inicial de voxeis na segunda dim
+nTE = 4; 
+nrep = 11000;
+
+
+
+
+%% STEP 1: Denoise with MTPCA
+
+close all
+
+dImg = zeros(size(img));
+
+s2 = squeeze(var(img(:,:,:,[5500:5506]-131),[],4));
+figure, imagesc(s2(:,:,4))
+%%
+tic
+parfor i=1:4
+[dImg(:,:,i,:), P(:,:,i)] = denoise_tpca(squeeze(img(:,:,i,:)), [10 10], s2(:,:,i), [], 0);
+end
+%%
+close all
+
+ite = 4;
+irep =222;
+
+figure, 
+subplot(141), imagesc(img(:,:,ite,irep)); title('orig');
+subplot(142), imagesc(squeeze(dImg(:,:,ite,irep))); title('denoised tpca');
+subplot(143), imagesc((img(:,:,ite,irep)-dImg(:,:,ite,irep))); title('difference');
+subplot(144), plot(squeeze(img(32,35,:,irep)),'*r'); hold on, plot(squeeze(dImg(32,35,:,irep)),'*b');  
+
+%%
+
+figure, 
+subplot(121),plot(squeeze(img(32,35,:,:))');
+subplot(122),plot(squeeze(dImg(32,35,:,:))');
+%% STEP 1: Registration
+
+[nx, ny, nTE, nrep] = size(dImg);
+rngRef = 5800:5900;   % Range for averaging to define the reference image
+usfac = 10;           % Upsampling factor for subpixel registration
+
+registered_img = zeros(nx, ny, nTE, nrep);  % Preallocate output
+
+disp('Starting multi-echo registration...')
+
+for e = 1:nTE
+    disp(['Registering Echo ' num2str(e) '...'])
+    
+    % Extract echo-specific data
+    img_echo = squeeze(dImg(:,:,e,:));  % [nx, ny, nrep]
+    Res = img_echo;
+    rRes = zeros(size(Res));  % Preallocate
+    
+    % Compute reference image in Fourier domain
+    refIm = ifft2(mean(Res(:,:,rngRef), 3));
+    
+    % Register all frames for this echo
+    for i = 1:nrep
+        tmp = ifft2(Res(:,:,i));  % Convert frame to Fourier domain
+        [~, Greg] = dftregistration(refIm, tmp, usfac);  % Register
+        rRes(:,:,i) = fft2(Greg);  % Back to image space
+    end
+    
+    % Store the registered result (real part only)
+    registered_img(:,:,e,:) = real(rRes);
+    
+    disp(['Echo ' num2str(e) ' registration done.'])
+end
+
+disp('All echoes registered and recombined.')
+save(['registered_img.mat'], 'registered_img');
+
+
+%% See if registration was ok
+
+% Define your three windows
+winBeg = 1500:1600;
+winMid = 5000:5100;
+winEnd = 11100:11200;
+
+% Preallocate
+meanVals = zeros(3,1);
+
+% Choose whether to average over echoes or pick one:
+% – To average over *all* echoes: 
+for k = 1:3
+    frames = {winBeg, winMid, winEnd};
+    meanVals(k) = mean(registered_img(:,:,:,frames{k}) , 'all' );
+end
+
+% If instead you want to look at Echo #1 only, replace the loop body with:
+% meanVals(k) = mean( registered_img(:,:,1,frames{k}) , 'all' );
+
+% Plot the three summary points
+figure;
+plot(1:3, meanVals, '-o','LineWidth',2,'MarkerSize',8);
+xticks(1:3);
+xticklabels({'Beg (1500–1600)','Mid (5000–5100)','End (11100–11200)'});
+xlabel('Window');
+ylabel('Mean intensity');
+title('Registration Quality Check');
+grid on;
+
+% Compute deviations
+devMidAbs = meanVals(2) - meanVals(1);
+devEndAbs = meanVals(3) - meanVals(1);
+devMidPct = devMidAbs / meanVals(1) * 100;
+devEndPct = devEndAbs / meanVals(1) * 100;
+
+fprintf('Absolute deviation Middle vs Beginning: %.4f\n', devMidAbs);
+fprintf('Absolute deviation End vs Beginning:    %.4f\n', devEndAbs);
+fprintf('Percent deviation Middle vs Beginning: %.2f%%\n', devMidPct);
+fprintf('Percent deviation End vs Beginning:    %.2f%%\n', devEndPct);
+
+%% Crop image
+
+img_cut_reps=registered_img(:,:,:,1001:end);
+% new size = 56 x 72 x 4 x 11000
+[nx,ny,nTE,nrep]=size(img_cut_reps);
+
+
+%% Mask brain
+
+nr_rep = 8000;      % Repetition for display
+echo_display = 2;   
+region='brain';
+
+output_folder = [filename filesep 'Masks'];
+if ~exist(output_folder,'dir')
+    mkdir(output_folder);
+end
+
+figure, imagesc(img_cut_reps(:,:,echo_display,nr_rep)); colormap(gray(256)); axis image; axis off; shg                      % View image
+mask = roipoly;                                                                                                         % Use roipoly to specify a polygonal region of interest (ROI) within an image. roipoly returns a binary image that you can use as a mask for masked filtering.
+save([output_folder filesep 'Mask_' region '_scan_' num2str(exp_no) '_slice_' num2str(nr_rep)],'mask');
+figure, imagesc(mask); colormap(gray(256)); axis image; axis off; shg                                                   % View mask
+
+mask_ech_rep = repmat(mask,[1 1 size(img_cut_reps,3) size(img_cut_reps,4)]);                                                                              % Mask*Number of echoes
+masked_img = img_cut_reps(:,:,:,:);                                                                                    % Apply mask
+masked_img(~mask_ech_rep) = nan;        
+figure, imagesc(masked_img(:,:,echo_display)); colormap(gray(256)); axis image; axis off; shg
+
+
+
+%% STEP 2: Compute T2* map from time-averaged signals (linear)
+
+TEs = [5.6; 19.2; 32.8; 46.4];  % Echo times
+nTE = length(TEs);
+
+X = [ones(nTE,1), -TEs];  % Design matrix: intercept and slope
+
+[nx, ny, ~, nrep] = size(masked_img);
+avg_signal = mean(masked_img, 4);
+
+T2_map = nan(nx, ny);
+S0_map = nan(nx, ny);
+
+for ix = 1:nx
+    for iy = 1:ny
+        % Take signal across TEs for this voxel
+        y = squeeze(avg_signal(ix, iy, :));
+        
+        % Avoid NaNs and zeros
+        if all(isfinite(y)) && all(y > 0)
+            log_y = log(y);
+            
+            % Linear regression: beta = (X'X)^-1 X'y
+            beta = (X' * X) \ (X' * log_y);
+            
+            % Extract fitted parameters
+            lnS0 = beta(1);
+            invT2 = beta(2);
+            
+            S0_map(ix, iy) = exp(lnS0);
+            T2_map(ix, iy) = 1 / invT2;
+        end
+    end
+end
+
+% Save T2 map as PNG
+figure; 
+imagesc(T2_map, [0 80]), axis image off, colormap(turbo);
+colorbar; title('T2* Map');
+saveas(gcf, ['T2star_map.png']);
+
+% Save S0 map as PNG
+figure; 
+imagesc(S0_map), axis image off, colormap(turbo);
+colorbar; title('S0 Map');
+saveas(gcf, ['S0_map.png']);
+
+
+% Save as MAT
+save(['T2S0_maps.mat'], 'T2_map', 'S0_map');
+      
+
+%%  STEP 3: Weighted echo combination (WEC)
+
+% Initialize combined signal
+combined_signal = nan(nx, ny, nrep);  % one time series per voxel
+
+for ix = 1:nx
+    for iy = 1:ny
+        % retrieve T2* for this voxel
+        T2star = T2_map(ix, iy);
+        
+        if ~isnan(T2star) && T2star > 0
+            % compute weights
+            weights = TEs .* exp(-TEs ./ T2star);
+            weights = weights ./ sum(weights);  % normalize
+            
+            % loop over time
+            for t = 1:nrep
+                signal = squeeze(img_cut_reps(ix, iy, :, t));  % (nTE x 1)
+                
+                % weighted sum
+                combined_signal(ix, iy, t) = sum(signal .* weights);
+            end
+        end
+    end
+end
+
+
+rep_to_plot = 8000;
+figure, imagesc(combined_signal(:,:,rep_to_plot),[0 30]), axis image off, colormap(gray);colorbar
+title(['Optimally Combined Image at repetition ' num2str(rep_to_plot)]);
+
+% Save image as PNG
+saveas(gcf, ['WEC_Image_rep' num2str(rep_to_plot) '.png']);
+
+save(['Combined_WEC_Signal.mat'], 'combined_signal');
+
+%% STEP 3: Spatial Smoothing
+
+sigma = 1;  % Standard deviation of Gaussian kernel (in pixels)
+h = fspecial('gaussian', [1 1], sigma);
+
+DataSmoothed = zeros(size(combined_signal));  % [nx, ny, nrep]
+
+disp('Starting spatial smoothing...')
+
+for t = 1:nrep
+    slice = combined_signal(:,:,t);
+
+    % Apply smoothing only within the mask
+    tmp = slice;
+    tmp(~mask) = 0;
+    tmp_smoothed = imfilter(tmp, h, 'replicate');
+
+    norm_mask = double(mask);
+    norm_mask_smoothed = imfilter(norm_mask, h, 'replicate');
+
+    smoothed_slice = nan(nx, ny);
+    smoothed_slice(mask) = tmp_smoothed(mask) ./ norm_mask_smoothed(mask);
+
+    DataSmoothed(:,:,t) = smoothed_slice;
+end
+
+disp('Spatial smoothing complete.');
+
+figure; imagesc(DataSmoothed(:,:,nr_rep)); axis image off; colormap(gray);
+
+%% PSpectra
+
+mask_index= find(mask(:)>0);
+data = permute(combined_signal,[3 1 2]); 
+data = squeeze(data(:,:)); 
+data = data(:,mask_index);
+
+
+TR = 0.09;
+Fs = 1/TR;
+
+figure()
+clf
+%data_tspec = dat(:); % dat is the average data across the voxels inside the mask by timepoints (1xntimepoints)
+dat=data';
+data_tspec = mean(dat,1);
+[Power, freqZ] = pwelch(detrend(data_tspec),[],[],[],Fs);
+
+plot(freqZ,Power,'k');title('Weighted echo combined data'); xlim([0 6]);ylabel('P'); xlabel('Frequency (Hz)')
+saveas(gcf, ['Powerspectra_detrended.png']);
+
+
+%% Filtered timecourse 
+
+bpLow= 0.01;  % in Hz
+bpHigh  = 5.3;  % in Hz
+% Increased to 0.8 to add more noise 
+
+DataFilt = zeros(size(DataSmoothed)); 
+
+for i=1:nx
+    for j=1:ny   
+            if mask(i,j)>0
+        DataFilt(i,j,:) = detrend (bandpassJC(detrend(squeeze(DataSmoothed(i,j,:))),[bpLow,bpHigh],1/TR,0) );
+            end
+    end 
+end
+
+
+mask_index= find(mask(:)>0);
+data = permute(DataFilt,[3 1 2]); 
+data = squeeze(data(:,:)); 
+data = data(:,mask_index);
+
+figure()
+clf
+%data_tspec = dat(:); % dat is the average data across the voxels inside the mask by timepoints (1xntimepoints)
+dat=data';
+data_tspec = nanmean(dat,1);
+[Power, freqZ] = pwelch(detrend(data_tspec),[],[],[],Fs);
+
+figure, plot(freqZ,Power,'k');title('Weighted echo combined data'); xlim([0 0.8]);ylabel('P'); xlabel('Frequency (Hz)')
+saveas(gcf, ['Powerspectra_detrended_filtered.png']);
+ 
+%% Crop image
+
+DataFilt_cut=DataFilt(:,:,501:end-500);
+% new size = 56 x 72 x 4 x 11000
+[nx,ny,nTE,nrep]=size(DataFilt_cut);
+
+%% STEP 4:  PCA on the weighted echo combined data
+
+[nx, ny, nrep] = size(DataFilt_cut);
+mask_index = find(mask);
+
+% Extract masked data
+nVox = numel(mask_index);
+data_reshaped = reshape(DataFilt_cut, nx*ny, nrep);  % [voxels x time]
+data_masked = data_reshaped(mask_index, :);  % [nVox x time]
+
+% Transpose for PCA (time x voxels)
+data_for_pca = data_masked;
+
+%% Normalize
+data_z = zscore(data_for_pca, 0, 2);  % row-wise normalization
+
+%This ensures that each voxel’s timecourse has the same variance before PCA, 
+%which is important to prevent high-variance voxels from dominating the PCA solution.
+
+
+data_z = (data_z - nanmean(data_z(:))) / std(data_z(:));  % global z-score
+
+%This step ensures that the entire dataset is on the same scale overall. ...
+% It equalizes variance across both timepoints and voxels, which can help PCA work better in some contexts 
+% (e.g. when component selection is done via information criteria like AIC/MDL, or when sources are expected to be balanced).
+
+
+%% Run PCA on preprocessed data
+
+n_pca_components=30;
+[coeffs, score, latent] = pca(data_z', 'NumComponents', n_pca_components);
+pca_data=score'; %pca components x timepoints 
+
+pca_matrix= coeffs * score';
+
+variance_explained = latent / sum(latent) * 100;
+cumulative_variance = cumsum(variance_explained);
+n_components_95 = find(cumulative_variance >= 95, 1, 'first');
+fprintf('Componentes para ≥95%% da variância: %d\n', n_components_95);
+
+% Plot
+figure;
+plot(1:length(variance_explained), variance_explained, 'o-', 'LineWidth', 1.5);
+hold on;
+plot(1:length(cumulative_variance), cumulative_variance, 'r--', 'LineWidth', 1.5);
+xlabel('Principal Component');
+ylabel('Variance Explained (%)');
+title('PCA Elbow Plot');
+legend('Individual','Cumulative');
+grid on;
+
+
+
+
+%% SPATIAL ICA: ICA on [time x components] to get independent spatial patterns
+M=50;
+n_components=30;
+sRs = icassoEst('randinit', pca_matrix', M,'numOfIC', n_components);
+sRs = icassoExp(sRs);
+%icassoShow(sRs, 'L', n_components, 'estimate', 'demixing');
+%[iq, icaSM, w, icaTC] = icassoShow(sRs,'L',n_components,'colorlimit', [.6 .7 .8 .9]);
+
+%Zica_spat_icasso= sRs.whiteningMatrix * sRs.signal;
+run        = 1;                              % pick any ICASSO run you like
+mixing     = sRs.A{run};                     % 10000 × 30   ← TRUE A
+Zica_spat_icasso = mixing' * pca_matrix';  % 30 × 4032  (comp × vox)
+
+% project the component maps from the 30-PC space back to voxel space
+% A_voxels   = coeffs(:,1:n_pca_components) * mixing.';   % (vox × comp)
+% A_voxels   = A_voxels.';                                % (comp × vox)
+
+% % keep only masked voxels – size becomes 30 × 1 258 (matches your loop)
+% Zica_spat_icasso = A_voxels(:, mask_index);
+% 
+% % back-project IC maps from PCA space to voxel space
+% A_voxels   = coeffs(:,1:n_pca_components) * mixing.';   % vox × comp
+% A_voxels   = A_voxels.'; 
+
+A_maps_spat = nan(nx, ny, n_components);
+for c = 1:n_components
+    A_temp = nan(nx * ny, 1);
+    A_temp(mask_index) = Zica_spat_icasso(c, :)';
+    A_maps_spat(:,:,c) = reshape(A_temp, nx, ny);
+end
+
+
+
+%% Proccess img_cut_reps equally to Combined data 
+
+%% Spatial smoothing 
+sigma = 1;  % Standard deviation of Gaussian kernel (in pixels)
+h = fspecial('gaussian', [1 1], sigma);
+
+ImgSmoothed = zeros(size(masked_img));  % [nx, ny, nrep]
+
+disp('Starting spatial smoothing...')
+
+for e =1:4
+    for t = 1:nrep
+        slice = masked_img(:,:,e,t);
+
+        % Apply smoothing only within the mask
+        tmp = slice;
+        tmp(~mask) = 0;
+        tmp_smoothed = imfilter(tmp, h, 'replicate');
+
+        norm_mask = double(mask);
+        norm_mask_smoothed = imfilter(norm_mask, h, 'replicate');
+
+        smoothed_slice = nan(nx, ny);
+        smoothed_slice(mask) = tmp_smoothed(mask) ./ norm_mask_smoothed(mask);
+
+        ImgSmoothed(:,:,e,t) = smoothed_slice;
+    end
+end
+
+disp('Spatial smoothing complete.');
+
+figure; imagesc(ImgSmoothed(:,:,1,nr_rep)); axis image off; colormap(gray);
+
+%% Filtered timecourse 
+bpLow=  0.01;  % in Hz
+bpHigh  =5.3;  % in Hz
+% Increased to 0.8 to add more noise 
+
+ImgFilt = zeros(size(ImgSmoothed)); 
+
+for e = 1:4
+    for i=1:nx
+        for j=1:ny
+            if mask(i,j)>0
+                ImgFilt(i,j,e,:) = detrend(bandpassJC(detrend(squeeze(ImgSmoothed(i,j,e,:))),[bpLow,bpHigh],1/TR,0) );
+            end
+        end
+    end
+end
+
+mask_index= find(mask(:)>0);
+data = permute(ImgFilt,[4 1 2 3]); 
+data = squeeze(data(:,:)); 
+data = data(:,mask_index);
+
+figure()
+clf
+%data_tspec = dat(:); % dat is the average data across the voxels inside the mask by timepoints (1xntimepoints)
+dat=data';
+data_tspec = mean(dat,1);
+[Power, freqZ] = pwelch(detrend(data_tspec),[],[],[],Fs);
+
+figure, plot(freqZ,Power,'k');title('Multi echo data'); xlim([0 0.8]);ylabel('P'); xlabel('Frequency (Hz)')
+saveas(gcf, ['Powerspectra_detrended_filtered.png']);
+ 
+
+ImgFilt_cut=ImgFilt(:,:,:,501:end-500);
+% new size = 56 x 72 x 4 x 11000
+[nx,ny,nTE,nrep]=size(ImgFilt_cut);
+
+
+%% Kappa/Rho for Temporal and Spatial ICA
+% [nx, ny, nTE, nrep] = size(DataFilt_cut);
+% mask_index = find(mask);
+
+data_reshaped = reshape(ImgFilt_cut, nx*ny, nTE, nrep);  % [voxels x TEs x time]
+data_masked = data_reshaped(mask_index,:,:);    % [n_voxels x nTE x time]
+n_voxels = size(data_masked, 1);
+
+% ========== SPATIAL ICA KAPPA/RHO ==========
+n_spat = size(sRs.whiteningMatrix,1);
+betas_spat = nan(n_voxels, nTE, n_spat);
+sources_T_spat = sRs.A{run};
+
+sources_T_spat_zscore=zscore(sources_T_spat);
+
+for v = 1:n_voxels
+    for e = 1:nTE
+        y = squeeze(data_masked(v, e, :));
+        yz=zscore(y);
+        %beta = (sources_T_spat' * sources_T_spat) \ (sources_T_spat' * y);
+        B = pinv(sources_T_spat_zscore) * yz;
+        betas_spat(v, e, :) = B;
+    end
+end
+betas_spat(find(betas_spat > 0.999)) = 0.999;
+betas_spat(find(betas_spat < -0.999)) = -0.999;
+
+
+%z_spat=atanh(betas_spat);
+%z_spat_sqr=z_spat.^2;
+%z_spat_sqr_sqz=squeeze(z_spat_sqr);
+%z_maps = squeeze( sum( z_spat.^2 , 2 ) );  % [nVox × nComp]
+
+z_maps  = zscore(mixing',0,2);      % vox × comp   (tedana style)
+weight  = z_maps.^2;
+%% Kappa and rho calculation
+%mixing=sRs.whiteningMatrix';
+[f_t2_maps, f_s0_maps, pred_t2_maps, pred_s0_maps] = calculate_f_maps(data_masked, z_maps, mixing, TEs);
+
+kappas_spat = sum( weight .* f_t2_maps, 1 )  ./ sum(weight,1);   % 1×C
+rhos_spat   = sum( weight .* f_s0_maps, 1 )  ./ sum(weight,1);   % 1×C
+
+
+
+%%
+
+% kappas_spat, rhos_spat are [C×1] arrays from your S5a/S5b step
+
+% 1) Choose a threshold.  Tedana uses the median κ across components:
+threshold = median(kappas_spat, 'omitnan');
+
+% 2) Classify BOLD‐like components:
+isBOLD = (kappas_spat > rhos_spat) ...   % more TE‐dependent than independent
+       & (kappas_spat > threshold);      % and above the median κ
+
+% 3) (Optional) the complement are “non‐BOLD‐like”:
+isNonBOLD = ~isBOLD & isfinite(kappas_spat) & isfinite(rhos_spat);
+
+% 4) Example: list indices
+boldIdx    = find(isBOLD);
+nonBoldIdx = find(isNonBOLD);
+
+% 5) Plot to verify
+figure; hold on;
+scatter(rhos_spat, kappas_spat, 60, 'k','filled');
+scatter(rhos_spat(boldIdx), kappas_spat(boldIdx), 80, 'g','filled');
+scatter(rhos_spat(nonBoldIdx), kappas_spat(nonBoldIdx), 80, 'r','filled');
+xlabel('\rho'); ylabel('\kappa');
+legend('all','BOLD‐like','non‐BOLD‐like');
+grid on;
+
+%% PLOT SPATIAL
+
+
+% Filter out invalid values
+valid_idx = isfinite(kappas_spat) & isfinite(rhos_spat);
+
+% Plot
+figure;
+scatter(rhos_spat(valid_idx), kappas_spat(valid_idx), 60, 'filled');
+xlabel('Rho (TE-independent)');
+ylabel('Kappa (TE-dependent)');
+title('Component TE-dependence');
+grid on;
+
+% Optionally annotate BOLD and non-BOLD components
+%threshold_spat = median(kappas_spat(valid_idx), 'omitnan');
+BOLD_components_spat = find(kappas_spat > rhos_spat);
+nonBOLD_components_spat = find(kappas_spat < rhos_spat);
+
+hold on;
+scatter(rhos_spat(BOLD_components_spat), kappas_spat(BOLD_components_spat), 60, 'g', 'filled');
+scatter(rhos_spat(nonBOLD_components_spat), kappas_spat(nonBOLD_components_spat), 60, 'r', 'filled');
+legend('Valid Components', 'BOLD-like', 'non-BOLD-like');
+
+% Save
+saveas(gcf, 'Kappa_vs_Rho_Scatter_spatial.png');
+
+%% Temporal vs Spatial ICA Plots (Spatial Maps, Timecourses, Power Spectra)
+
+
+Fs = 1 / TR;  % Sampling frequency
+
+for c = 1:n_components
+    figure('Name', sprintf('Component %d', c), 'Position', [100, 100, 1600, 800]);
+    % === SPATIAL ICA ===
+    % Spatial Map
+    subplot(3, 1, 1);
+    imagesc(A_maps_spat(:,:,c));
+    axis image off;
+    colormap(turbo); colorbar;
+    title(sprintf('Spatial ICA - Spatial Map %d', c), 'FontWeight', 'bold');
+
+    % Timecourse
+    subplot(3, 1, 2);
+    plot(sRs.whiteningMatrix(c,:), 'k');
+    xlabel('Timepoints'); ylabel('Amplitude');
+    ylim([-0.005 0.005])
+    title(sprintf('Spatial ICA - Timecourse | Kappa=%.2f | Rho=%.2f', kappas_spat(c), rhos_spat(c)), 'FontWeight', 'bold');
+    grid on;
+
+    % Power Spectrum
+    subplot(3, 1, 3);
+    [Pxx_sp, F_sp] = pwelch(detrend(sRs.whiteningMatrix(c,:)), [], [], [], Fs);
+    plot(F_sp, Pxx_sp, 'k');
+    xlim([0 5.5]);
+    xlabel('Frequency (Hz)'); ylabel('Power');
+    title('Spatial ICA - Power Spectrum');
+    grid on;
+    saveas(gcf, ['Component' num2str(c) ' _kappaandrho_pca'  num2str(n_pca_components) '_ica'  num2str(n_components) '.png']);
+    saveas(gcf, 'Kappa_vs_Rho_Scatter_temporal.png');
+end
+
+
