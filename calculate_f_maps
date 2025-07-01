@@ -1,0 +1,70 @@
+function [f_t2_maps, f_s0_maps, pred_t2_maps, pred_s0_maps] = calculate_f_maps(data_cat, z_maps, mixing, tes)
+% calculate_f_maps  Compute pseudo–F maps for TE–dependence (κ) and TE–independence (ρ)
+%
+% Inputs:
+%   data_cat : M×E×T array of multi‐echo time‐series (voxels × echoes × time)
+%   z_maps   : M×C Z‐statistic maps (not used in F‐map calculation itself)
+%   mixing   : T×C mixing matrix (ICA timecourses)
+%   tes      : E×1 vector of echo times
+%
+% Outputs:
+%   f_t2_maps    : M×C pseudo–F statistics for the TE–dependence model (κ)
+%   f_s0_maps    : M×C pseudo–F statistics for the TE–independence model (ρ)
+%   pred_t2_maps : M×E×C model fits for the TE–dependence model
+%   pred_s0_maps : M×E×C model fits for the TE–independence model
+fmax=500;
+[M, E, T] = size(data_cat);
+C         = size(z_maps,2);
+
+% 1) Estimate per‐voxel, per‐echo betas: B = pinv(mixing) * y(t)
+me_betas = nan(M, E, C);
+pinvMix  = pinv(mixing);  % C×T
+for v = 1:M
+    for e = 1:E
+        y = squeeze(data_cat(v,e,:));       % T×1
+         yz=zscore(y);
+        me_betas(v,e,:) = pinvMix * yz;      % C×1
+    end
+end
+
+% 2) Prepare μ‐weighted design matrices
+mu    = squeeze(mean(data_cat,3));       % M×E
+x1    = mu';                             % E×M
+tes   = tes(:);                          % E×1
+x2    = tes * ones(1,M) .* x1;           % E×M  (TE * u)
+
+% 3) Allocate outputs
+f_t2_maps    = zeros(M, C);
+f_s0_maps    = zeros(M, C);
+pred_t2_maps = zeros(M, E, C);
+pred_s0_maps = zeros(M, E, C);
+df            = E - 1;                   % residual DOF
+
+% 4) Loop over components
+for c = 1:C
+    % component‐specific betas: E×M
+    comp_betas = squeeze(me_betas(:,:,c))';   
+    % total power per voxel α
+    alpha      = sum(comp_betas.^2, 1);         % 1×M
+
+    %% ρ model: constant across TE (S3a → S4b)
+    coeffs_s0    = sum(comp_betas .* x1, 1) ./ sum(x1.^2, 1);    % 1×M
+    pred_s0      = x1 .* (ones(E,1) * coeffs_s0);               % E×M
+    sse_s0       = sum((comp_betas - pred_s0).^2, 1);           % 1×M
+    fs0           = (alpha - sse_s0) * df ./ sse_s0;             % 1×M
+
+    fs0(fs0>fmax)=fmax;
+    f_s0_maps(:,c)      = fs0';                                 % M×1
+    pred_s0_maps(:,:,c) = pred_s0';                            % M×E
+
+    %% κ model: linear‐in‐TE (S3b → S4a)
+    coeffs_t2    = sum(comp_betas .* x2, 1) ./ sum(x2.^2, 1);   % 1×M
+    pred_t2      = x2 .* (ones(E,1) * coeffs_t2);               % E×M
+    sse_t2       = sum((comp_betas - pred_t2).^2, 1);           % 1×M
+    ft2           = (alpha - sse_t2) * df ./ sse_t2;             % 1×M
+
+    ft2(ft2>fmax)=fmax;
+    f_t2_maps(:,c)      = ft2';                                 % M×1
+    pred_t2_maps(:,:,c) = pred_t2';                            % M×E
+end
+end
